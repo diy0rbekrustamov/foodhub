@@ -16,6 +16,7 @@ export function CartProvider({ children }) {
   };
 
   const total = cart.reduce((a, c) => a + c.price * c.qty, 0);
+  const count = cart.reduce((a, c) => a + c.qty, 0);
 
   return (
     <CartContext.Provider
@@ -28,6 +29,7 @@ export function CartProvider({ children }) {
         setSelectedItem,
         addToCart,
         total,
+        count,
       }}
     >
       {children}

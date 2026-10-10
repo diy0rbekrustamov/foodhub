@@ -1,0 +1,5 @@
+{
+  "name": "food-hub",
+  "description": "Fast food delivery app for ordering burgers, pizza, chicken, snacks, and drinks.",
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
