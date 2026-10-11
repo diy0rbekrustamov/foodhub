@@ -1,31 +1,82 @@
-import { useState, useEffect } from "react";
-import { APIProvider, Map, AdvancedMarker } from "@vis.gl/react-google-maps";
-import { MapPin, Phone, Clock, Navigation, Compass, ExternalLink, CheckCircle } from "lucide-react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import L from "leaflet";
+import {
+  MapPin,
+  Phone,
+  Clock,
+  Navigation,
+  Compass,
+  ExternalLink,
+  CheckCircle,
+  Crosshair,
+  Loader2,
+} from "lucide-react";
 import { getBranches } from "../../firebase/services";
+import { calculateDistanceKm } from "../../utils/geocoding";
 
-const GOOGLE_MAPS_API_KEY =
-  import.meta.env.VITE_GOOGLE_MAPS_API_KEY || "AIzaSyC6wA-wLsoAGFJXGbPqJSzfxVglAjahAKE";
+function createBranchIcon(isSelected, name) {
+  const bg = isSelected ? "#e63946" : "#1a1612";
+  const border = isSelected ? "#ffffff" : "rgba(245, 158, 11, 0.7)";
+  const textColor = isSelected ? "#ffffff" : "#fbbf24";
+  const scale = isSelected ? "scale(1.15)" : "scale(1)";
+  const zIndex = isSelected ? 1000 : 100;
+
+  return L.divIcon({
+    className: "custom-branch-marker",
+    html: `
+      <div style="position: relative; transform: translate(-50%, -100%) ${scale}; cursor: pointer; z-index: ${zIndex}; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; align-items: center;">
+        <div style="background-color: ${bg}; color: ${textColor}; border: 1.5px solid ${border}; padding: 4px 10px; border-radius: 9999px; font-size: 11px; font-weight: 800; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5); white-space: nowrap; display: flex; align-items: center; gap: 4px;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
+          ${name}
+        </div>
+        <div style="width: 8px; height: 8px; background-color: ${bg}; transform: rotate(45deg); margin-top: -4px; border-right: 1.5px solid ${border}; border-bottom: 1.5px solid ${border};"></div>
+      </div>
+    `,
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+}
+
+function createUserIcon() {
+  return L.divIcon({
+    className: "custom-user-marker",
+    html: `
+      <div style="position: relative; transform: translate(-50%, -50%); display: flex; align-items: center; justify-content: center;">
+        <span style="position: absolute; width: 34px; height: 34px; border-radius: 9999px; background: rgba(59, 130, 246, 0.35); animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;"></span>
+        <span style="position: absolute; width: 20px; height: 20px; border-radius: 9999px; background: rgba(59, 130, 246, 0.6);"></span>
+        <span style="position: relative; width: 12px; height: 12px; border-radius: 9999px; background: #2563eb; border: 2.5px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.4);"></span>
+      </div>
+    `,
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+}
 
 export default function BranchesSection() {
+  const mapContainerRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const markersRef = useRef(new Map());
+  const userMarkerRef = useRef(null);
+
   const [branches, setBranches] = useState([]);
   const [selectedCity, setSelectedCity] = useState("all");
   const [activeBranch, setActiveBranch] = useState(null);
-  const [mapCenter, setMapCenter] = useState({ lat: 39.7747, lng: 64.4286 }); // Bukhara
-  const [zoom, setZoom] = useState(13);
+  const [userCoords, setUserCoords] = useState(null);
+  const [isLocating, setIsLocating] = useState(false);
+  const [nearestInfo, setNearestInfo] = useState(null);
 
+  // Load branches from Firestore
   useEffect(() => {
     async function load() {
-      const list = await getBranches(false); // active branches only
+      const list = await getBranches(false); // active only
       setBranches(list || []);
       if (list && list.length > 0) {
         setActiveBranch(list[0]);
-        setMapCenter({ lat: Number(list[0].latitude), lng: Number(list[0].longitude) });
       }
     }
     load();
   }, []);
 
-  // Unique cities from branches
   const cities = Array.from(new Set(branches.map((b) => b.city).filter(Boolean)));
 
   const filteredBranches = branches.filter((b) => {
@@ -33,10 +84,159 @@ export default function BranchesSection() {
     return b.city?.toLowerCase() === selectedCity.toLowerCase();
   });
 
-  const handleSelectBranch = (branch) => {
+  // Initialize Leaflet Map
+  useEffect(() => {
+    if (!mapContainerRef.current) return;
+    if (mapInstanceRef.current) return;
+
+    const defaultLat = 39.7747;
+    const defaultLng = 64.4286;
+
+    const map = L.map(mapContainerRef.current, {
+      center: [defaultLat, defaultLng],
+      zoom: 13,
+      zoomControl: true,
+      fadeAnimation: true,
+      zoomAnimation: true,
+    });
+
+    mapInstanceRef.current = map;
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 19,
+    }).addTo(map);
+
+    setTimeout(() => {
+      map.invalidateSize();
+    }, 250);
+
+    return () => {
+      map.remove();
+      mapInstanceRef.current = null;
+    };
+  }, []);
+
+  // Update markers when branches change or active branch changes
+  // Handle select branch
+  const handleSelectBranch = useCallback((branch) => {
     setActiveBranch(branch);
-    setMapCenter({ lat: Number(branch.latitude), lng: Number(branch.longitude) });
-    setZoom(15);
+    const map = mapInstanceRef.current;
+    if (!map) return;
+
+    const lat = Number(branch.latitude);
+    const lng = Number(branch.longitude);
+    if (!isNaN(lat) && !isNaN(lng)) {
+      map.flyTo([lat, lng], 15, { animate: true, duration: 1 });
+    }
+  }, []);
+
+  // Update markers when branches change or active branch changes
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+
+    // Clear old markers
+    markersRef.current.forEach((marker) => marker.remove());
+    markersRef.current.clear();
+
+    const validBranches = filteredBranches.filter(
+      (b) => !isNaN(Number(b.latitude)) && !isNaN(Number(b.longitude))
+    );
+
+    if (validBranches.length === 0) return;
+
+    validBranches.forEach((branch) => {
+      const lat = Number(branch.latitude);
+      const lng = Number(branch.longitude);
+      const isSelected = activeBranch?.id === branch.id;
+
+      const marker = L.marker([lat, lng], {
+        icon: createBranchIcon(isSelected, branch.name),
+        zIndexOffset: isSelected ? 1000 : 100,
+      }).addTo(map);
+
+      marker.on("click", () => {
+        handleSelectBranch(branch);
+      });
+
+      markersRef.current.set(branch.id, marker);
+    });
+
+    // Auto-fit bounds if no single active branch is focused
+    if (validBranches.length > 0 && !activeBranch) {
+      const group = new L.featureGroup(Array.from(markersRef.current.values()));
+      map.fitBounds(group.getBounds().pad(0.15));
+    }
+  }, [filteredBranches, activeBranch, handleSelectBranch]);
+
+  // Locate User & Find Nearest Branch
+  const handleFindNearest = () => {
+    if (!navigator.geolocation) {
+      alert("Brauzeringiz geolokatsiyani qo'llab-quvvatlamaydi.");
+      return;
+    }
+
+    setIsLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setIsLocating(false);
+        const { latitude, longitude } = pos.coords;
+        setUserCoords({ lat: latitude, lng: longitude });
+
+        const map = mapInstanceRef.current;
+        if (!map) return;
+
+        // Add or move user marker
+        if (userMarkerRef.current) {
+          userMarkerRef.current.setLatLng([latitude, longitude]);
+        } else {
+          const uMarker = L.marker([latitude, longitude], {
+            icon: createUserIcon(),
+            zIndexOffset: 500,
+          }).addTo(map);
+          uMarker.bindPopup(`
+            <div style="font-size: 12px; color: white;">
+              <strong style="color: #60a5fa;">📍 Sizning joylashuvingiz</strong>
+            </div>
+          `);
+          userMarkerRef.current = uMarker;
+        }
+
+        // Find closest branch
+        let closest = null;
+        let minDistance = Infinity;
+
+        branches.forEach((b) => {
+          const bLat = Number(b.latitude);
+          const bLng = Number(b.longitude);
+          if (!isNaN(bLat) && !isNaN(bLng)) {
+            const d = calculateDistanceKm(latitude, longitude, bLat, bLng);
+            if (d < minDistance) {
+              minDistance = d;
+              closest = { ...b, distance: d };
+            }
+          }
+        });
+
+        if (closest) {
+          setActiveBranch(closest);
+          setNearestInfo(closest);
+          map.flyTo([Number(closest.latitude), Number(closest.longitude)], 15, {
+            duration: 1.2,
+          });
+        } else {
+          map.flyTo([latitude, longitude], 14, { duration: 1 });
+        }
+      },
+      (err) => {
+        setIsLocating(false);
+        console.warn("Geolocation error:", err.message);
+        alert("Joylashuvingizni aniqlashga ruxsat berilmadi.");
+      },
+      { timeout: 10000, enableHighAccuracy: true }
+    );
   };
 
   return (
@@ -55,25 +255,38 @@ export default function BranchesSection() {
               Bizning <span className="text-[#e63946] italic">filiallarimiz.</span>
             </h2>
             <p className="text-white/60 text-sm mt-3 max-w-xl">
-              Buxoro, Toshkent va butun O'zbekiston bo'ylab FoodHub restoranlari. Issiq taomlar, qulay lokatsiyalar va tezkor yetkazib berish.
+              Buxoro, Toshkent va butun O'zbekiston bo'ylab FoodHub restoranlari. Tezkor tayyorlanadi, xaritada qulay ko'rsatilgan.
             </p>
           </div>
 
-          {/* City Filter Pills */}
-          <div className="flex flex-wrap gap-2">
+          {/* Controls: Find Nearest & City Filters */}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={handleFindNearest}
+              disabled={isLocating}
+              className="px-4 py-2 rounded-full bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-blue-600/30 cursor-pointer disabled:opacity-50"
+            >
+              {isLocating ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Crosshair className="w-3.5 h-3.5" />
+              )}
+              {isLocating ? "Aniqlanmoqda..." : "Eng yaqin filialni topish"}
+            </button>
+
             <button
               onClick={() => {
                 setSelectedCity("all");
-                setZoom(12);
               }}
-              className={`px-4 py-2 rounded-full text-xs font-bold transition flex items-center gap-1.5 ${
+              className={`px-4 py-2 rounded-full text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
                 selectedCity === "all"
                   ? "bg-[#e63946] text-white shadow-lg shadow-[#e63946]/30"
                   : "bg-white/10 hover:bg-white/20 text-white/80"
               }`}
             >
-              <Compass className="w-3.5 h-3.5" /> Barcha filiallar ({branches.length})
+              <Compass className="w-3.5 h-3.5" /> Barchasi ({branches.length})
             </button>
+
             {cities.map((city) => {
               const count = branches.filter((b) => b.city === city).length;
               return (
@@ -83,11 +296,10 @@ export default function BranchesSection() {
                     setSelectedCity(city);
                     const firstInCity = branches.find((b) => b.city === city);
                     if (firstInCity) {
-                      setMapCenter({ lat: Number(firstInCity.latitude), lng: Number(firstInCity.longitude) });
-                      setZoom(14);
+                      handleSelectBranch(firstInCity);
                     }
                   }}
-                  className={`px-4 py-2 rounded-full text-xs font-bold transition ${
+                  className={`px-4 py-2 rounded-full text-xs font-bold transition cursor-pointer ${
                     selectedCity === city
                       ? "bg-[#e63946] text-white shadow-lg shadow-[#e63946]/30"
                       : "bg-white/10 hover:bg-white/20 text-white/80"
@@ -100,65 +312,46 @@ export default function BranchesSection() {
           </div>
         </div>
 
-        {/* Interactive Map & Branch List Layout */}
-        <div className="grid lg:grid-cols-[1.2fr_1fr] gap-8 items-start">
-          {/* Left: Google Map */}
-          <div className="relative h-[420px] md:h-[500px] rounded-3xl overflow-hidden border border-white/15 shadow-2xl">
-            <APIProvider apiKey={GOOGLE_MAPS_API_KEY}>
-              <Map
-                style={{ width: "100%", height: "100%" }}
-                defaultCenter={mapCenter}
-                center={mapCenter}
-                defaultZoom={13}
-                zoom={zoom}
-                mapId="DEMO_MAP_ID"
-                gestureHandling="greedy"
-                disableDefaultUI={false}
-                internalUsageAttributionIds={["gmp_mcp_codeassist_v1_aistudio"]}
-              >
-                {filteredBranches.map((branch) => {
-                  const isSelected = activeBranch?.id === branch.id;
-                  const lat = Number(branch.latitude);
-                  const lng = Number(branch.longitude);
-                  if (isNaN(lat) || isNaN(lng)) return null;
-
-                  return (
-                    <AdvancedMarker
-                      key={branch.id}
-                      position={{ lat, lng }}
-                      onClick={() => handleSelectBranch(branch)}
-                    >
-                      <div
-                        className={`relative -translate-x-1/2 -translate-y-full flex flex-col items-center cursor-pointer transition transform hover:scale-110 ${
-                          isSelected ? "scale-115 z-30" : "z-10"
-                        }`}
-                      >
-                        <div
-                          className={`px-3 py-1.5 rounded-full text-xs font-black shadow-2xl flex items-center gap-1.5 whitespace-nowrap border ${
-                            isSelected
-                              ? "bg-[#e63946] text-white border-white ring-4 ring-[#e63946]/30"
-                              : "bg-[#0e0b08] text-white border-amber-400/40 hover:border-amber-400"
-                          }`}
-                        >
-                          <MapPin className="w-3.5 h-3.5 text-amber-400" />
-                          <span>{branch.name}</span>
-                        </div>
-                        <div
-                          className={`w-2.5 h-2.5 rotate-45 -mt-1.5 shadow ${
-                            isSelected ? "bg-[#e63946]" : "bg-[#0e0b08]"
-                          }`}
-                        />
-                      </div>
-                    </AdvancedMarker>
-                  );
-                })}
-              </Map>
-            </APIProvider>
-
-            <div className="absolute bottom-3 left-3 bg-[#0e0b08]/85 backdrop-blur-md px-3.5 py-1.5 rounded-full text-[11px] text-white/80 border border-white/10 flex items-center gap-2">
-              <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Har bir filialda yangi tayyorlanadi</span>
+        {/* Nearest Info Banner */}
+        {nearestInfo && (
+          <div className="mb-6 p-4 rounded-2xl bg-blue-950/60 border border-blue-500/30 flex items-center justify-between gap-4 text-xs">
+            <div className="flex items-center gap-2.5">
+              <span className="w-3 h-3 rounded-full bg-blue-400 animate-ping shrink-0" />
+              <div>
+                <span className="font-bold text-white block">
+                  Eng yaqin filial: {nearestInfo.name} ({nearestInfo.city})
+                </span>
+                <span className="text-blue-300/80">
+                  Sizdan taxminan {nearestInfo.distance} km masofada joylashgan
+                </span>
+              </div>
             </div>
+            <button
+              onClick={() => handleSelectBranch(nearestInfo)}
+              className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold whitespace-nowrap cursor-pointer"
+            >
+              Ko'rish
+            </button>
+          </div>
+        )}
+
+        {/* Interactive Leaflet Map & Branch List */}
+        <div className="grid lg:grid-cols-[1.2fr_1fr] gap-8 items-start">
+          {/* Left: Leaflet Map */}
+          <div className="relative h-[420px] md:h-[500px] rounded-3xl overflow-hidden border border-white/15 shadow-2xl">
+            <div ref={mapContainerRef} className="w-full h-full" />
+
+            <div className="absolute bottom-3 left-3 bg-[#0e0b08]/85 backdrop-blur-md px-3.5 py-1.5 rounded-full text-[11px] text-white/80 border border-white/10 flex items-center gap-2 z-[1000]">
+              <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Har bir filialda yangi taomlar tayyorlanadi</span>
+            </div>
+
+            {userCoords && (
+              <div className="absolute top-3 right-3 bg-blue-950/80 backdrop-blur-md text-blue-200 border border-blue-500/30 px-3 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1.5 z-[1000] shadow-md">
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+                Lokatsiyangiz aniqlandi
+              </div>
+            )}
           </div>
 
           {/* Right: Branch Cards List */}
@@ -217,9 +410,9 @@ export default function BranchesSection() {
                     <button
                       type="button"
                       onClick={() => handleSelectBranch(branch)}
-                      className="text-xs font-bold text-[#e63946] hover:text-[#ff4d5c] flex items-center gap-1"
+                      className="text-xs font-bold text-[#e63946] hover:text-[#ff4d5c] flex items-center gap-1 cursor-pointer"
                     >
-                      <Navigation className="w-3.5 h-3.5" /> Xaritada belgilash
+                      <Navigation className="w-3.5 h-3.5" /> Xaritada ko'rsatish
                     </button>
 
                     <a
@@ -229,7 +422,7 @@ export default function BranchesSection() {
                       onClick={(e) => e.stopPropagation()}
                       className="text-xs text-white/50 hover:text-white flex items-center gap-1 transition"
                     >
-                      <ExternalLink className="w-3 h-3" /> Yo'nalish
+                      <ExternalLink className="w-3 h-3" /> Yo'nalish olish
                     </a>
                   </div>
                 </div>

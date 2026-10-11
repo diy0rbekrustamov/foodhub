@@ -20,11 +20,22 @@
       "properties": {
         "id": { "type": "string" },
         "email": { "type": "string", "maxLength": 100 },
-        "phoneNumber": { "type": "string", "maxLength": 30 },
+        "displayName": { "type": "string", "maxLength": 100 },
         "role": { "type": "string", "enum": ["admin", "superadmin"] },
         "createdAt": { "type": "string" }
       },
       "required": ["id", "role"]
+    },
+    "AdminEmail": {
+      "title": "AdminEmail",
+      "description": "Designated administrator email whitelist",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "maxLength": 100 },
+        "role": { "type": "string", "enum": ["admin", "superadmin"] },
+        "addedAt": { "type": "string" }
+      },
+      "required": ["email", "role"]
     },
     "AdminInvitation": {
       "title": "AdminInvitation",
@@ -187,6 +198,10 @@
     "/admins/{userId}": {
       "schema": { "$ref": "#/entities/Admin" },
       "description": "Designated administrator credentials list"
+    },
+    "/adminEmails/{emailDoc}": {
+      "schema": { "$ref": "#/entities/AdminEmail" },
+      "description": "Administrator email whitelist"
     },
     "/adminInvitations/{invitationId}": {
       "schema": { "$ref": "#/entities/AdminInvitation" },

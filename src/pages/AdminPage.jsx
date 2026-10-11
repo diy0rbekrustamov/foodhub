@@ -19,7 +19,12 @@ import {
   seedInitialBranches,
   uploadImageFile,
   seedInitialMenuIfEmpty,
-  designateAdmin,
+  getAdmins,
+  getRegisteredUsers,
+  createAdminWithEmailPassword,
+  promoteUserToAdmin,
+  promoteByEmail,
+  removeAdmin,
 } from "../firebase/services";
 import { checkDuplicateBranch } from "../utils/geocoding";
 import BranchMapAdmin from "../components/map/BranchMapAdmin";
@@ -45,6 +50,12 @@ import {
   AlertTriangle,
   Crosshair,
   Loader2,
+  ShieldCheck,
+  UserCheck,
+  Users,
+  UserPlus,
+  Lock,
+  UserX,
 } from "lucide-react";
 
 export default function AdminPage() {
@@ -57,8 +68,16 @@ export default function AdminPage() {
   const [products, setProducts] = useState([]);
   const [orders, setOrders] = useState([]);
   const [branches, setBranches] = useState([]);
+  const [adminsList, setAdminsList] = useState([]);
+  const [registeredUsersList, setRegisteredUsersList] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
   const [notification, setNotification] = useState(null);
+
+  // Admin Management form states
+  const [adminActionLoading, setAdminActionLoading] = useState(false);
+  const [newAdminForm, setNewAdminForm] = useState({ displayName: "", email: "", password: "" });
+  const [promoteEmailInput, setPromoteEmailInput] = useState("");
+  const [userSearchTerm, setUserSearchTerm] = useState("");
 
   // Filters
   const [productSearch, setProductSearch] = useState("");
@@ -119,7 +138,6 @@ export default function AdminPage() {
   });
 
   const [imageUploading, setImageUploading] = useState(false);
-  const [newAdminUid, setNewAdminUid] = useState("");
 
   // Toast notifier
   const notify = (msg, type = "success") => {
@@ -131,16 +149,20 @@ export default function AdminPage() {
   const loadData = async () => {
     try {
       setRefreshing(true);
-      const [cats, prods, ords, brs] = await Promise.all([
+      const [cats, prods, ords, brs, adms, usrs] = await Promise.all([
         getCategories().catch(() => []),
         getProducts().catch(() => []),
         getOrders().catch(() => []),
         getBranches(true).catch(() => []), // load all including inactive
+        getAdmins().catch(() => []),
+        getRegisteredUsers().catch(() => []),
       ]);
       setCategories(cats || []);
       setProducts(prods || []);
       setOrders(ords || []);
       setBranches(brs || []);
+      setAdminsList(adms || []);
+      setRegisteredUsersList(usrs || []);
     } catch (err) {
       console.error("Failed to load admin data:", err);
       notify("Ma'lumotlarni yuklashda xatolik", "error");
@@ -612,16 +634,104 @@ export default function AdminPage() {
     }
   };
 
-  const handleAddAdmin = async (e) => {
+  // 1. Create brand new admin with Email and Password
+  const handleCreateAdminAccount = async (e) => {
     e.preventDefault();
-    if (!newAdminUid.trim()) return;
+    if (adminActionLoading) return;
+
+    if (!newAdminForm.email?.trim() || !newAdminForm.password) {
+      notify("Email va parolni to'liq kiriting", "error");
+      return;
+    }
+    if (newAdminForm.password.length < 6) {
+      notify("Parol kamida 6 ta belgidan iborat bo'lishi kerak", "error");
+      return;
+    }
+
+    setAdminActionLoading(true);
     try {
-      await designateAdmin(newAdminUid.trim());
-      notify("Yangi admin muvaffaqiyatli biriktirildi!");
-      setNewAdminUid("");
+      await createAdminWithEmailPassword({
+        email: newAdminForm.email.trim(),
+        password: newAdminForm.password,
+        displayName: newAdminForm.displayName.trim(),
+        currentAdminEmail: currentUser?.email,
+      });
+      notify("Yangi admin hisobi muvaffaqiyatli yaratildi!");
+      setNewAdminForm({ displayName: "", email: "", password: "" });
+      await loadData();
     } catch (err) {
       console.error(err);
-      notify("Admin qo'shishda xatolik", "error");
+      notify(err.message || "Admin hisobini yaratishda xatolik", "error");
+    } finally {
+      setAdminActionLoading(false);
+    }
+  };
+
+  // 2. Promote by Gmail / Email
+  const handlePromoteEmailSubmit = async (e) => {
+    e.preventDefault();
+    if (adminActionLoading) return;
+    if (!promoteEmailInput?.trim() || !promoteEmailInput.includes("@")) {
+      notify("Yaroqli email manzilini kiriting", "error");
+      return;
+    }
+
+    setAdminActionLoading(true);
+    try {
+      await promoteByEmail(promoteEmailInput.trim(), currentUser?.email);
+      notify(`${promoteEmailInput.trim()} adminlar safiga qo'shildi!`);
+      setPromoteEmailInput("");
+      await loadData();
+    } catch (err) {
+      console.error(err);
+      notify(err.message || "Adminlikka biriktirishda xatolik", "error");
+    } finally {
+      setAdminActionLoading(false);
+    }
+  };
+
+  // 3. Promote Existing Registered User
+  const handlePromoteExistingUser = async (u) => {
+    if (adminActionLoading) return;
+    setAdminActionLoading(true);
+    try {
+      await promoteUserToAdmin(u.id, u.email, u.displayName, currentUser?.email);
+      notify(`${u.displayName || u.email} admin darajasiga ko'tarildi!`);
+      await loadData();
+    } catch (err) {
+      console.error(err);
+      notify(err.message || "Adminlikka ko'tarishda xatolik", "error");
+    } finally {
+      setAdminActionLoading(false);
+    }
+  };
+
+  // 4. Remove Admin (Demote)
+  const handleRemoveAdminUser = async (adm) => {
+    if (adminActionLoading) return;
+    if (adm.isSuperAdmin || adm.email === "dierbekrustamov040@gmail.com") {
+      notify("Asosiy Superadminni o'chirib bo'lmaydi!", "error");
+      return;
+    }
+    if (adm.email === currentUser?.email) {
+      notify("O'zingizni adminlikdan olib tashlay olmaysiz!", "error");
+      return;
+    }
+
+    if (!window.confirm(`${adm.displayName || adm.email} adminlikdan chiqarilsinmi?`)) {
+      return;
+    }
+
+    setAdminActionLoading(true);
+    try {
+      await removeAdmin(adm.uid || adm.id, adm.email, currentUser?.email);
+      notify(`${adm.displayName || adm.email} adminlikdan olib tashlandi!`);
+      await loadData();
+    } catch (err) {
+      console.error(err);
+      notify(err.message || "Adminlikdan olishda xatolik", "error");
+    } finally {
+      setAdminActionLoading(false);
     }
   };
 
@@ -667,6 +777,7 @@ export default function AdminPage() {
               { id: "products", label: "Taomlar Menyusi", icon: UtensilsCrossed, badge: products.length },
               { id: "categories", label: "Kategoriyalar", icon: Layers, badge: categories.length },
               { id: "orders", label: "Buyurtmalar", icon: ShoppingBag, badge: stats.newOrdersCount || null },
+              { id: "admins", label: "Adminlar Boshqaruvi", icon: ShieldCheck, badge: adminsList.length },
               { id: "settings", label: "Sozlamalar & Seed", icon: Settings },
             ].map((tab) => {
               const Icon = tab.icon;
@@ -737,10 +848,13 @@ export default function AdminPage() {
               {activeTab === "products" && "Taomlar Menyusi"}
               {activeTab === "categories" && "Taom Kategoriyalari"}
               {activeTab === "orders" && "Kelib Tushgan Buyurtmalar"}
+              {activeTab === "admins" && "Adminlar va Xodimlar Boshqaruvi"}
               {activeTab === "settings" && "Tizim Sozlamalari"}
             </h1>
             <p className="text-xs text-white/50 mt-0.5">
-              {activeTab === "branches"
+              {activeTab === "admins"
+                ? "Yangi adminlarni email va parol bilan biriktirish, mavjud mijozlarni admin qilish yoki bekor qilish"
+                : activeTab === "branches"
                 ? "Buxoro, Toshkent va dunyo bo'ylab FoodHub filiallarini xaritada boshqarish"
                 : "Real vaqt rejimida yangilanuvchi ma'lumotlar"}
             </p>
@@ -1477,6 +1591,299 @@ export default function AdminPage() {
           </div>
         )}
 
+        {/* TAB: ADMINS MANAGEMENT */}
+        {activeTab === "admins" && (
+          <div className="p-6 md:p-8 space-y-6">
+            {/* Admin Stats Overview */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="bg-[#14100c] border border-white/10 rounded-2xl p-5 flex items-center gap-4">
+                <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <p className="text-white/50 text-xs">Jami Adminlar</p>
+                  <p className="text-2xl font-black text-white">{adminsList.length} ta</p>
+                </div>
+              </div>
+
+              <div className="bg-[#14100c] border border-white/10 rounded-2xl p-5 flex items-center gap-4">
+                <div className="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                  <Users className="w-6 h-6" />
+                </div>
+                <div>
+                  <p className="text-white/50 text-xs">Ro'yxatdan o'tgan Mijozlar</p>
+                  <p className="text-2xl font-black text-white">{registeredUsersList.length} ta</p>
+                </div>
+              </div>
+
+              <div className="bg-[#14100c] border border-white/10 rounded-2xl p-5 flex items-center gap-4">
+                <div className="w-12 h-12 rounded-xl bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400">
+                  <Lock className="w-6 h-6" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-white/50 text-xs">Asosiy Superadmin</p>
+                  <p className="text-xs font-bold text-white truncate">dierbekrustamov040@gmail.com</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Two Column Layout: Admins List & Add Admin Actions */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              {/* LEFT: Current Admins List (7 cols) */}
+              <div className="lg:col-span-7 bg-[#14100c] border border-white/10 rounded-3xl p-6 shadow-xl space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-white/10">
+                  <div>
+                    <h3 className="font-black text-lg text-white">Faol Administratorlar Ro'yxati</h3>
+                    <p className="text-xs text-white/50">Tizimni boshqarish huquqiga ega bo'lgan foydalanuvchilar</p>
+                  </div>
+                  <span className="text-xs bg-white/10 text-white font-mono px-3 py-1 rounded-full">
+                    {adminsList.length} nafar
+                  </span>
+                </div>
+
+                <div className="divide-y divide-white/5">
+                  {adminsList.map((adm) => {
+                    const isOwner = adm.isSuperAdmin || adm.email?.toLowerCase() === "dierbekrustamov040@gmail.com";
+                    const isSelf = adm.email?.toLowerCase() === currentUser?.email?.toLowerCase();
+
+                    return (
+                      <div
+                        key={adm.id || adm.email}
+                        className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-white/[0.02] px-2 rounded-xl transition"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div
+                            className={`w-10 h-10 rounded-xl flex items-center justify-center text-sm font-black shrink-0 ${
+                              isOwner
+                                ? "bg-amber-500/20 text-amber-400 border border-amber-500/30"
+                                : "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
+                            }`}
+                          >
+                            {isOwner ? "👑" : <ShieldCheck className="w-5 h-5" />}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-bold text-white truncate">
+                                {adm.displayName || adm.email?.split("@")[0] || "Admin"}
+                              </p>
+                              {isOwner && (
+                                <span className="bg-amber-500/20 text-amber-300 text-[10px] font-black px-2 py-0.5 rounded-full border border-amber-500/30">
+                                  SUPERADMIN
+                                </span>
+                              )}
+                              {!isOwner && (
+                                <span className="bg-emerald-500/20 text-emerald-300 text-[10px] font-bold px-2 py-0.5 rounded-full border border-emerald-500/30">
+                                  ADMIN
+                                </span>
+                              )}
+                              {isSelf && (
+                                <span className="bg-blue-500/20 text-blue-300 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                                  Siz
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-white/50 font-mono truncate">{adm.email}</p>
+                          </div>
+                        </div>
+
+                        {/* Action: Remove Admin */}
+                        <div className="shrink-0 flex items-center justify-end">
+                          {isOwner ? (
+                            <span className="text-[11px] text-white/40 italic px-2 py-1 bg-white/5 rounded-lg">
+                              Asosiy ega
+                            </span>
+                          ) : isSelf ? (
+                            <span className="text-[11px] text-white/40 italic px-2 py-1 bg-white/5 rounded-lg">
+                              Joriy profilingiz
+                            </span>
+                          ) : (
+                            <button
+                              onClick={() => handleRemoveAdminUser(adm)}
+                              disabled={adminActionLoading}
+                              className="px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 text-red-400 hover:text-red-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-50"
+                              title="Adminlikdan olish"
+                            >
+                              <UserX className="w-3.5 h-3.5" />
+                              <span>Adminlikdan olish</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* RIGHT: Add Admin Actions (5 cols) */}
+              <div className="lg:col-span-5 space-y-6">
+                {/* METHOD 1: Create New Admin with Email & Password */}
+                <div className="bg-[#14100c] border border-white/10 rounded-3xl p-6 shadow-xl space-y-4">
+                  <div className="flex items-center gap-2.5 pb-3 border-b border-white/10">
+                    <UserPlus className="w-5 h-5 text-[#e63946]" />
+                    <div>
+                      <h4 className="font-black text-sm text-white">Yangi Admin Yaratish (Email & Parol)</h4>
+                      <p className="text-[11px] text-white/50">Admin uchun to'g'ridan-to'g'ri yangi akkaunt ochish</p>
+                    </div>
+                  </div>
+
+                  <form onSubmit={handleCreateAdminAccount} className="space-y-3">
+                    <div>
+                      <label className="block text-[11px] text-white/70 font-semibold mb-1">
+                        Admin Ismi
+                      </label>
+                      <input
+                        type="text"
+                        value={newAdminForm.displayName}
+                        onChange={(e) => setNewAdminForm({ ...newAdminForm, displayName: e.target.value })}
+                        placeholder="Masalan: Sardor Rahimov"
+                        className="w-full bg-white/5 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-white outline-none focus:border-[#e63946] transition"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] text-white/70 font-semibold mb-1">
+                        Email Manzili *
+                      </label>
+                      <input
+                        type="email"
+                        required
+                        value={newAdminForm.email}
+                        onChange={(e) => setNewAdminForm({ ...newAdminForm, email: e.target.value })}
+                        placeholder="admin@foodhub.uz yoki misol@gmail.com"
+                        className="w-full bg-white/5 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-white outline-none focus:border-[#e63946] transition"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] text-white/70 font-semibold mb-1">
+                        Yangi Parol * (Kamida 6 belgi)
+                      </label>
+                      <input
+                        type="password"
+                        required
+                        value={newAdminForm.password}
+                        onChange={(e) => setNewAdminForm({ ...newAdminForm, password: e.target.value })}
+                        placeholder="••••••••"
+                        className="w-full bg-white/5 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-white outline-none focus:border-[#e63946] transition"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={adminActionLoading}
+                      className="w-full bg-[#e63946] hover:bg-[#ff4d5c] text-white text-xs font-bold py-2.5 rounded-xl transition flex items-center justify-center gap-2 shadow-lg disabled:opacity-50 mt-2"
+                    >
+                      {adminActionLoading ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" /> Yaratilmoqda...
+                        </>
+                      ) : (
+                        <>
+                          <UserPlus className="w-3.5 h-3.5" /> Admin Hisobini Ochish
+                        </>
+                      )}
+                    </button>
+                  </form>
+                </div>
+
+                {/* METHOD 2: Promote Existing User / Gmail */}
+                <div className="bg-[#14100c] border border-white/10 rounded-3xl p-6 shadow-xl space-y-4">
+                  <div className="flex items-center gap-2.5 pb-3 border-b border-white/10">
+                    <UserCheck className="w-5 h-5 text-emerald-400" />
+                    <div>
+                      <h4 className="font-black text-sm text-white">Mavjud Foydalanuvchini Admin Qilish</h4>
+                      <p className="text-[11px] text-white/50">Gmail yoki email orqali adminlikka ko'tarish</p>
+                    </div>
+                  </div>
+
+                  {/* Promote by typing email */}
+                  <form onSubmit={handlePromoteEmailSubmit} className="flex gap-2">
+                    <input
+                      type="email"
+                      value={promoteEmailInput}
+                      onChange={(e) => setPromoteEmailInput(e.target.value)}
+                      placeholder="foydalanuvchi@gmail.com..."
+                      className="flex-1 bg-white/5 border border-white/10 rounded-xl px-3.5 py-2 text-xs text-white outline-none focus:border-emerald-500 transition"
+                    />
+                    <button
+                      type="submit"
+                      disabled={adminActionLoading}
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-4 py-2 rounded-xl transition flex items-center gap-1.5 disabled:opacity-50 shrink-0"
+                    >
+                      {adminActionLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                      Admin Qilish
+                    </button>
+                  </form>
+
+                  {/* Promote from registered users list */}
+                  <div className="pt-2">
+                    <div className="flex items-center justify-between mb-2">
+                      <label className="text-[11px] text-white/60 font-semibold">
+                        Ro'yxatdan o'tgan mijozlardan tanlash
+                      </label>
+                      <span className="text-[10px] text-white/40">{registeredUsersList.length} ta foydalanuvchi</span>
+                    </div>
+
+                    <div className="relative mb-2">
+                      <Search className="w-3 h-3 text-white/40 absolute left-3 top-2.5" />
+                      <input
+                        type="text"
+                        value={userSearchTerm}
+                        onChange={(e) => setUserSearchTerm(e.target.value)}
+                        placeholder="Mijoz ismi yoki emaili..."
+                        className="w-full bg-white/5 border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-[11px] text-white outline-none focus:border-white/30"
+                      />
+                    </div>
+
+                    <div className="max-h-48 overflow-y-auto divide-y divide-white/5 bg-black/20 rounded-xl p-1 border border-white/5">
+                      {registeredUsersList
+                        .filter((u) => {
+                          const isAlreadyAdmin = adminsList.some(
+                            (a) => a.email?.toLowerCase() === u.email?.toLowerCase() || a.uid === u.id
+                          );
+                          if (isAlreadyAdmin) return false;
+                          if (!userSearchTerm) return true;
+                          const term = userSearchTerm.toLowerCase();
+                          return (
+                            u.email?.toLowerCase().includes(term) ||
+                            u.displayName?.toLowerCase().includes(term)
+                          );
+                        })
+                        .slice(0, 10)
+                        .map((u) => (
+                          <div
+                            key={u.id}
+                            className="py-2 px-2.5 flex items-center justify-between gap-2 hover:bg-white/5 rounded-lg text-xs"
+                          >
+                            <div className="min-w-0">
+                              <p className="font-semibold text-white truncate text-[11px]">
+                                {u.displayName || "Mijoz"}
+                              </p>
+                              <p className="text-[10px] text-white/50 truncate font-mono">{u.email}</p>
+                            </div>
+                            <button
+                              onClick={() => handlePromoteExistingUser(u)}
+                              disabled={adminActionLoading}
+                              className="px-2.5 py-1 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/20 rounded-lg text-[10px] font-bold shrink-0 transition"
+                            >
+                              + Admin qilish
+                            </button>
+                          </div>
+                        ))}
+
+                      {registeredUsersList.filter((u) => !adminsList.some((a) => a.email === u.email)).length === 0 && (
+                        <p className="text-center py-4 text-[11px] text-white/40">
+                          Barcha ro'yxatdan o'tgan foydalanuvchilar admin sifatida qo'shilgan yoki mijozlar hali mavjud emas.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* TAB 6: SETTINGS */}
         {activeTab === "settings" && (
           <div className="p-6 md:p-8 space-y-6 max-w-4xl">
@@ -1504,27 +1911,21 @@ export default function AdminPage() {
               </div>
             </div>
 
-            {/* Admin Designation Card */}
+            {/* Admin Management Quick Link Card */}
             <div className="bg-[#14100c] border border-white/10 rounded-3xl p-6 shadow-xl space-y-4">
-              <h3 className="font-black text-lg text-white">Yangi Admin Biriktirish</h3>
+              <h3 className="font-black text-lg text-white">Adminlar Boshqaruvi</h3>
               <p className="text-xs text-white/60 leading-relaxed">
-                Boshqa foydalanuvchiga to'liq admin boshqaruv huquqini berish uchun uning Firebase UID identifikatorini kiriting.
+                Yangi admin qo'shish, mavjud foydalanuvchilarni admin qilish yoki adminlikdan chiqarish uchun chap menyudagi <strong>"Adminlar Boshqaruvi"</strong> bo'limidan foydalaning.
               </p>
-              <form onSubmit={handleAddAdmin} className="flex gap-2">
-                <input
-                  type="text"
-                  value={newAdminUid}
-                  onChange={(e) => setNewAdminUid(e.target.value)}
-                  placeholder="Foydalanuvchi UID..."
-                  className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-xs text-white outline-none focus:border-[#e63946]"
-                />
+              <div>
                 <button
-                  type="submit"
-                  className="bg-white/10 hover:bg-white/20 text-white text-xs font-bold px-5 py-2.5 rounded-xl transition"
+                  onClick={() => setActiveTab("admins")}
+                  className="bg-white/10 hover:bg-white/20 text-white text-xs font-bold px-5 py-2.5 rounded-xl transition flex items-center gap-2"
                 >
-                  Tayinlash
+                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                  Adminlar Boshqaruviga O'tish
                 </button>
-              </form>
+              </div>
             </div>
           </div>
         )}

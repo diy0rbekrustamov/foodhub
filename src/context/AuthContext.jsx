@@ -1,15 +1,16 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import {
-  RecaptchaVerifier,
-  signInWithPhoneNumber,
   signInWithPopup,
   GoogleAuthProvider,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  updateProfile,
   signOut,
   onAuthStateChanged,
 } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { auth, db } from "../firebase/config";
-import { checkIsAdmin, designateAdmin } from "../firebase/services";
+import { checkIsAdmin, promoteByEmail } from "../firebase/services";
 
 export const AuthContext = createContext();
 
@@ -17,23 +18,10 @@ export function AuthProvider({ children }) {
   const [currentUser, setCurrentUser] = useState(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [confirmationResult, setConfirmationResult] = useState(null);
-  const [simulatedPhone, setSimulatedPhone] = useState(null);
   const [authError, setAuthError] = useState(null);
 
-  // Sync auth state
+  // Sync auth state with Firebase Auth
   useEffect(() => {
-    // Check local fallback user first if Firebase user not active
-    const savedLocalUser = localStorage.getItem("foodhub_simulated_user");
-    let fallbackUser = null;
-    if (savedLocalUser) {
-      try {
-        fallbackUser = JSON.parse(savedLocalUser);
-      } catch {
-        localStorage.removeItem("foodhub_simulated_user");
-      }
-    }
-
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         setCurrentUser(user);
@@ -46,22 +34,21 @@ export function AuthProvider({ children }) {
           if (!userSnap.exists()) {
             await setDoc(userDocRef, {
               id: user.uid,
-              phoneNumber: user.phoneNumber || "",
               email: user.email || "",
-              displayName: user.displayName || "Mijoz",
+              displayName: user.displayName || user.email?.split("@")[0] || "Mijoz",
               role: adminStatus ? "admin" : "customer",
               createdAt: new Date().toISOString(),
             });
+          } else {
+            // Keep role synced if designated admin
+            const currentRole = userSnap.data()?.role;
+            if (adminStatus && currentRole !== "admin") {
+              await setDoc(userDocRef, { role: "admin" }, { merge: true });
+            }
           }
         } catch (e) {
           console.warn("User profile sync error:", e);
         }
-      } else if (fallbackUser) {
-        setCurrentUser(fallbackUser);
-        const adminStatus =
-          fallbackUser.email === "dierbekrustamov040@gmail.com" ||
-          fallbackUser.role === "admin";
-        setIsAdmin(adminStatus);
       } else {
         setCurrentUser(null);
         setIsAdmin(false);
@@ -72,114 +59,74 @@ export function AuthProvider({ children }) {
     return () => unsubscribe();
   }, []);
 
-  // Set up reCAPTCHA verifier for phone auth
-  const initRecaptcha = (containerId = "recaptcha-container") => {
-    try {
-      if (window.recaptchaVerifier) {
-        window.recaptchaVerifier.clear();
-      }
-      window.recaptchaVerifier = new RecaptchaVerifier(auth, containerId, {
-        size: "invisible",
-        callback: () => {
-          // reCAPTCHA solved
-        },
-        "expired-callback": () => {
-          setAuthError("reCAPTCHA muddati tugadi. Qaytadan urinib ko'ring.");
-        },
-      });
-      return window.recaptchaVerifier;
-    } catch (err) {
-      console.warn("Recaptcha initialization notice:", err);
-      return null;
-    }
-  };
-
-  // Send OTP SMS
-  const sendOtp = async (phoneNumber, containerId = "recaptcha-container") => {
+  // Email and Password Sign In
+  const signInWithEmail = async (email, password) => {
     setAuthError(null);
-    setSimulatedPhone(null);
-
     try {
-      const verifier = initRecaptcha(containerId);
-      if (!verifier) {
-        throw { code: "auth/operation-not-allowed" };
-      }
-      const confirmation = await signInWithPhoneNumber(auth, phoneNumber, verifier);
-      setConfirmationResult(confirmation);
-      return { isSimulation: false, confirmation };
-    } catch (err) {
-      console.warn("SMS send result:", err.code || err.message);
-
-      // Handle un-enabled Phone Auth in Firebase Console gracefully with development mode
-      if (err.code === "auth/operation-not-allowed") {
-        const demoOtp = "123456";
-        setSimulatedPhone({ phone: phoneNumber, code: demoOtp });
-        return { isSimulation: true, code: demoOtp };
-      }
-
-      let userFriendly = "SMS yuborishda xatolik yuz berdi.";
-      if (err.code === "auth/invalid-phone-number") {
-        userFriendly = "Telefon raqami noto'g'ri kiritildi (+998XXXXXXXXX ko'rinishida bo'lsin).";
-      } else if (err.code === "auth/too-many-requests") {
-        userFriendly = "So'rovlar soni oshib ketdi. Iltimos, biroz kutib qaytadan urinib ko'ring.";
-      } else if (err.code === "auth/captcha-check-failed") {
-        userFriendly = "reCAPTCHA tekshiruvidan o'tmadi.";
-      } else if (err.message) {
-        userFriendly = err.message;
-      }
-      setAuthError(userFriendly);
-      throw new Error(userFriendly);
-    }
-  };
-
-  // Verify OTP Code
-  const verifyOtp = async (otpCode) => {
-    setAuthError(null);
-
-    // If in simulation / development fallback
-    if (simulatedPhone) {
-      if (otpCode !== simulatedPhone.code && otpCode !== "123456") {
-        const msg = "Kiritilgan kod xato. Sinov uchun kod: 123456";
-        setAuthError(msg);
-        throw new Error(msg);
-      }
-
-      const simUser = {
-        uid: "user_" + simulatedPhone.phone.replace(/\D/g, ""),
-        phoneNumber: simulatedPhone.phone,
-        displayName: "Mijoz " + simulatedPhone.phone.slice(-4),
-        isPhoneVerified: true,
-      };
-      localStorage.setItem("foodhub_simulated_user", JSON.stringify(simUser));
-      setCurrentUser(simUser);
-      const adminStatus = await checkIsAdmin(simUser.uid, null);
-      setIsAdmin(adminStatus);
-      return { user: simUser, isAdmin: adminStatus };
-    }
-
-    if (!confirmationResult) {
-      const msg = "Avval SMS kod so'rang.";
-      setAuthError(msg);
-      throw new Error(msg);
-    }
-
-    try {
-      const credential = await confirmationResult.confirm(otpCode);
-      const user = credential.user;
+      const cred = await signInWithEmailAndPassword(auth, email.trim(), password);
+      const user = cred.user;
       setCurrentUser(user);
       const adminStatus = await checkIsAdmin(user.uid, user.email);
       setIsAdmin(adminStatus);
       return { user, isAdmin: adminStatus };
     } catch (err) {
-      console.error("OTP verify error:", err);
-      let userFriendly = "Tasdiqlash kodi noto'g'ri yoki muddati tugagan.";
-      if (err.code === "auth/invalid-verification-code") {
-        userFriendly = "Kiritilgan kod xato. Qaytadan tekshiring.";
-      } else if (err.code === "auth/code-expired") {
-        userFriendly = "Kodning amal qilish muddati tugagan. Yangi kod so'rang.";
+      console.warn("Email sign in error:", err.code);
+      let msg = "Kirishda xatolik yuz berdi.";
+      if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential" || err.code === "auth/wrong-password") {
+        msg = "Email yoki parol noto'g'ri kiritildi.";
+      } else if (err.code === "auth/invalid-email") {
+        msg = "Email formati noto'g'ri.";
+      } else if (err.code === "auth/too-many-requests") {
+        msg = "Urinishlar soni ko'payib ketdi. Biroz kutib qaytadan urinib ko'ring.";
       }
-      setAuthError(userFriendly);
-      throw new Error(userFriendly);
+      setAuthError(msg);
+      throw new Error(msg);
+    }
+  };
+
+  // Email and Password Sign Up (Registration)
+  const signUpWithEmail = async (email, password, displayName) => {
+    setAuthError(null);
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+      const user = cred.user;
+
+      if (displayName) {
+        try {
+          await updateProfile(user, { displayName });
+        } catch {}
+      }
+
+      const adminStatus = await checkIsAdmin(user.uid, user.email);
+      setIsAdmin(adminStatus);
+
+      // Create user profile in Firestore
+      try {
+        await setDoc(doc(db, "users", user.uid), {
+          id: user.uid,
+          email: user.email || "",
+          displayName: displayName || user.email?.split("@")[0] || "Mijoz",
+          role: adminStatus ? "admin" : "customer",
+          createdAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.warn("User doc create notice:", e.message);
+      }
+
+      setCurrentUser(user);
+      return { user, isAdmin: adminStatus };
+    } catch (err) {
+      console.warn("Sign up error:", err.code);
+      let msg = "Ro'yxatdan o'tishda xatolik yuz berdi.";
+      if (err.code === "auth/email-already-in-use") {
+        msg = "Bu email bilan akkaunt allaqachon mavjud. Kirish tugmasini bosing.";
+      } else if (err.code === "auth/weak-password") {
+        msg = "Parol juda oddiy. Kamida 6 ta belgi kiriting.";
+      } else if (err.code === "auth/invalid-email") {
+        msg = "Email manzili noto'g'ri kiritilgan.";
+      }
+      setAuthError(msg);
+      throw new Error(msg);
     }
   };
 
@@ -188,86 +135,69 @@ export function AuthProvider({ children }) {
     setAuthError(null);
     try {
       const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: "select_account" });
       const res = await signInWithPopup(auth, provider);
       const user = res.user;
       setCurrentUser(user);
       const adminStatus = await checkIsAdmin(user.uid, user.email);
       setIsAdmin(adminStatus);
+
+      // Profile sync
+      try {
+        const userDocRef = doc(db, "users", user.uid);
+        const snap = await getDoc(userDocRef);
+        if (!snap.exists()) {
+          await setDoc(userDocRef, {
+            id: user.uid,
+            email: user.email || "",
+            displayName: user.displayName || user.email?.split("@")[0] || "Mijoz",
+            role: adminStatus ? "admin" : "customer",
+            createdAt: new Date().toISOString(),
+          });
+        }
+      } catch {}
+
       return { user, isAdmin: adminStatus };
     } catch (err) {
       console.warn("Google sign-in attempt warning:", err.code);
+      let msg = "Google orqali kirishda xatolik yuz berdi.";
       if (err.code === "auth/popup-blocked") {
-        const msg = "Brauzer popup oynani blokladi (iFrame cheklovi). Iltimos, 'Tezkor Admin Kirish' tugmasidan foydalaning.";
-        setAuthError(msg);
-        throw new Error(msg);
+        msg = "Brauzeringiz popup oynani blokladi. Iltimos, Email va Parol orqali kiring yoki popupga ruxsat bering.";
+      } else if (err.code === "auth/popup-closed-by-user") {
+        msg = "Google orqali kirish oynasi yopildi.";
       }
-      const msg = "Google orqali kirishda xatolik yuz berdi.";
       setAuthError(msg);
       throw new Error(msg);
-    }
-  };
-
-  // Quick One-Click Demo Login (Guaranteed to work in all iFrames & environments)
-  const quickLogin = async (role = "admin") => {
-    setAuthError(null);
-    let userObj;
-    let adminStatus = false;
-
-    if (role === "admin") {
-      userObj = {
-        uid: "admin_dierbek_owner",
-        email: "dierbekrustamov040@gmail.com",
-        displayName: "Diyerbek Rustamov (Admin)",
-        role: "admin",
-      };
-      adminStatus = true;
-    } else {
-      userObj = {
-        uid: "cust_demo_guest",
-        phoneNumber: "+998901234567",
-        displayName: "Azizbek Karimov",
-        role: "customer",
-      };
-      adminStatus = false;
-    }
-
-    localStorage.setItem("foodhub_simulated_user", JSON.stringify(userObj));
-    setCurrentUser(userObj);
-    setIsAdmin(adminStatus);
-    return { user: userObj, isAdmin: adminStatus };
-  };
-
-  // Make current user admin (Bootstrap utility)
-  const claimAdminRole = async () => {
-    if (!currentUser) return false;
-    try {
-      await designateAdmin(currentUser.uid, {
-        email: currentUser.email || "",
-        phoneNumber: currentUser.phoneNumber || "",
-      });
-      setIsAdmin(true);
-      return true;
-    } catch (e) {
-      console.warn("Claim admin notice:", e);
-      // Fallback local persistence if offline
-      setIsAdmin(true);
-      return true;
     }
   };
 
   // Logout
   const logout = async () => {
     try {
-      localStorage.removeItem("foodhub_simulated_user");
       await signOut(auth);
       setCurrentUser(null);
       setIsAdmin(false);
-      setConfirmationResult(null);
-      setSimulatedPhone(null);
+      setAuthError(null);
     } catch (err) {
       console.warn("Sign out notice:", err);
       setCurrentUser(null);
       setIsAdmin(false);
+    }
+  };
+
+  // Claim admin role (for owner or bootstrap)
+  const claimAdminRole = async () => {
+    if (!currentUser) return false;
+    try {
+      if (currentUser.email) {
+        await promoteByEmail(currentUser.email, "self-bootstrap");
+      }
+      setIsAdmin(true);
+      return true;
+    } catch (e) {
+      console.warn("Claim admin role error:", e);
+      setIsAdmin(true);
+      return true;
     }
   };
 
@@ -278,11 +208,9 @@ export function AuthProvider({ children }) {
         isAdmin,
         loading,
         authError,
-        simulatedPhone,
-        sendOtp,
-        verifyOtp,
+        signInWithEmail,
+        signUpWithEmail,
         signInWithGoogle,
-        quickLogin,
         claimAdminRole,
         logout,
       }}

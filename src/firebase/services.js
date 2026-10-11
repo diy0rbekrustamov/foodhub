@@ -13,7 +13,10 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { initializeApp } from "firebase/app";
+import { getAuth, createUserWithEmailAndPassword, updateProfile, signOut } from "firebase/auth";
 import { db, storage } from "./config";
+import firebaseConfig from "../../firebase-applet-config.json";
 import { handleFirestoreError, OperationType } from "./errors";
 import { menu as initialMenuData } from "../data/menuData";
 
@@ -616,31 +619,37 @@ export async function logAuditEvent(action, performedBy, targetType, targetId, d
 }
 
 // ADMIN CHECK & MANAGEMENT
-export async function checkIsAdmin(uid, email, phoneNumber) {
-  if (email === "dierbekrustamov040@gmail.com") return true;
-  if (phoneNumber === "+998901234567") return true; // Owner demo
-  if (!uid && !phoneNumber) return false;
+export async function checkIsAdmin(uid, email) {
+  const normalizedEmail = (email || "").toLowerCase().trim();
+  if (normalizedEmail === "dierbekrustamov040@gmail.com") return true;
+  if (!uid && !normalizedEmail) return false;
 
   try {
     if (uid) {
       const adminDoc = await getDoc(doc(db, "admins", uid));
       if (adminDoc.exists()) return true;
     }
-    if (phoneNumber) {
-      const cleanPhone = phoneNumber.replace(/\s+/g, "");
-      const snap = await getDocs(
-        query(
-          collection(db, "adminInvitations"),
-          where("phoneNumber", "==", cleanPhone),
-          where("role", "==", "admin")
-        )
-      );
-      if (!snap.empty) return true;
+    if (normalizedEmail) {
+      const emailDoc = await getDoc(doc(db, "adminEmails", normalizedEmail));
+      if (emailDoc.exists()) {
+        // Self-sync to admins/{uid} so standard UID security rules work immediately
+        if (uid) {
+          try {
+            await setDoc(doc(db, "admins", uid), {
+              uid,
+              email: normalizedEmail,
+              role: "admin",
+              syncedAt: new Date().toISOString(),
+            });
+          } catch {}
+        }
+        return true;
+      }
     }
   } catch (err) {
     console.warn("Could not check admin status:", err);
   }
-  return email === "dierbekrustamov040@gmail.com";
+  return normalizedEmail === "dierbekrustamov040@gmail.com";
 }
 
 export async function designateAdmin(uid, data = {}) {
@@ -653,6 +662,274 @@ export async function designateAdmin(uid, data = {}) {
     return true;
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, `admins/${uid}`);
+  }
+}
+
+// Fetch all registered admins
+export async function getAdmins() {
+  const adminsMap = new Map();
+
+  // Always include permanent Superadmin
+  adminsMap.set("dierbekrustamov040@gmail.com", {
+    id: "superadmin_owner",
+    uid: "superadmin_owner",
+    email: "dierbekrustamov040@gmail.com",
+    displayName: "Diyerbek Rustamov",
+    role: "superadmin",
+    isSuperAdmin: true,
+    createdAt: "2024-01-01T00:00:00.000Z",
+  });
+
+  try {
+    const adminDocs = await getDocs(collection(db, "admins"));
+    adminDocs.forEach((d) => {
+      const data = d.data();
+      const em = (data.email || "").toLowerCase();
+      const key = em || d.id;
+      adminsMap.set(key, {
+        id: d.id,
+        uid: d.id,
+        ...data,
+        isSuperAdmin: em === "dierbekrustamov040@gmail.com",
+      });
+    });
+  } catch (e) {
+    console.warn("Fetching admins error:", e.message);
+  }
+
+  try {
+    const emailDocs = await getDocs(collection(db, "adminEmails"));
+    emailDocs.forEach((d) => {
+      const data = d.data();
+      const em = (data.email || d.id).toLowerCase();
+      if (!adminsMap.has(em)) {
+        adminsMap.set(em, {
+          id: d.id,
+          email: em,
+          displayName: data.displayName || em.split("@")[0],
+          role: "admin",
+          isSuperAdmin: em === "dierbekrustamov040@gmail.com",
+          createdAt: data.addedAt || new Date().toISOString(),
+          addedBy: data.addedBy || "admin",
+        });
+      }
+    });
+  } catch (e) {
+    console.warn("Fetching adminEmails error:", e.message);
+  }
+
+  return Array.from(adminsMap.values());
+}
+
+// Fetch all registered users for promotion
+export async function getRegisteredUsers() {
+  try {
+    const snap = await getDocs(collection(db, "users"));
+    return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch (e) {
+    console.warn("Error fetching registered users:", e.message);
+    return [];
+  }
+}
+
+// Create brand new admin with Email and Password without signing out active user
+export async function createAdminWithEmailPassword({ email, password, displayName, currentAdminEmail }) {
+  if (!email || !password) {
+    throw new Error("Email va parol kiritilishi shart");
+  }
+  if (password.length < 6) {
+    throw new Error("Parol kamida 6 ta belgidan iborat bo'lishi kerak");
+  }
+
+  const normalizedEmail = email.toLowerCase().trim();
+
+  // Initialize secondary Firebase App instance for separate auth context
+  const secondaryAppName = "SecondaryAdminApp_" + Date.now();
+  const secondaryApp = initializeApp(firebaseConfig, secondaryAppName);
+  const secondaryAuth = getAuth(secondaryApp);
+
+  try {
+    const cred = await createUserWithEmailAndPassword(secondaryAuth, normalizedEmail, password);
+    const newUid = cred.user.uid;
+
+    if (displayName) {
+      try {
+        await updateProfile(cred.user, { displayName });
+      } catch {}
+    }
+
+    // Save to Firestore collections
+    const nowIso = new Date().toISOString();
+    await setDoc(doc(db, "admins", newUid), {
+      uid: newUid,
+      email: normalizedEmail,
+      displayName: displayName || normalizedEmail.split("@")[0],
+      role: "admin",
+      createdAt: nowIso,
+      createdBy: currentAdminEmail || "superadmin",
+    });
+
+    await setDoc(doc(db, "adminEmails", normalizedEmail), {
+      email: normalizedEmail,
+      displayName: displayName || normalizedEmail.split("@")[0],
+      role: "admin",
+      addedAt: nowIso,
+      addedBy: currentAdminEmail || "superadmin",
+    });
+
+    await setDoc(doc(db, "users", newUid), {
+      id: newUid,
+      email: normalizedEmail,
+      displayName: displayName || normalizedEmail.split("@")[0],
+      role: "admin",
+      createdAt: nowIso,
+    });
+
+    await logAuditEvent("CREATE_ADMIN", currentAdminEmail, "admins", newUid, `${normalizedEmail} yangi admin sifatida ro'yxatdan o'tkazildi`);
+
+    // Clean up secondary auth
+    await signOut(secondaryAuth);
+
+    return {
+      uid: newUid,
+      email: normalizedEmail,
+      displayName: displayName || normalizedEmail.split("@")[0],
+      role: "admin",
+    };
+  } catch (err) {
+    console.error("Create admin error:", err);
+    if (err.code === "auth/email-already-in-use") {
+      throw new Error("Bu email manziliga ega hisob allaqachon mavjud. Foydalanuvchini ro'yxatdan admin darajasiga ko'tarish funksiyasidan foydalaning.");
+    } else if (err.code === "auth/invalid-email") {
+      throw new Error("Email formati noto'g'ri kiritildi.");
+    }
+    throw new Error(err.message || "Admin hisobini yaratishda xatolik yuz berdi.");
+  }
+}
+
+// Promote an existing registered user to Admin
+export async function promoteUserToAdmin(userId, userEmail, userName, currentAdminEmail) {
+  const normalizedEmail = (userEmail || "").toLowerCase().trim();
+  const nowIso = new Date().toISOString();
+
+  try {
+    // 1. Update user document
+    const userDocRef = doc(db, "users", userId);
+    await updateDoc(userDocRef, {
+      role: "admin",
+      promotedAt: nowIso,
+    });
+
+    // 2. Set admins collection document
+    await setDoc(doc(db, "admins", userId), {
+      uid: userId,
+      email: normalizedEmail,
+      displayName: userName || normalizedEmail.split("@")[0] || "Admin",
+      role: "admin",
+      promotedAt: nowIso,
+      promotedBy: currentAdminEmail || "admin",
+    });
+
+    // 3. Set adminEmails allowlist
+    if (normalizedEmail) {
+      await setDoc(doc(db, "adminEmails", normalizedEmail), {
+        email: normalizedEmail,
+        displayName: userName || normalizedEmail.split("@")[0] || "Admin",
+        role: "admin",
+        addedAt: nowIso,
+        addedBy: currentAdminEmail || "admin",
+      });
+    }
+
+    await logAuditEvent("PROMOTE_ADMIN", currentAdminEmail, "users", userId, `${normalizedEmail} admin darajasiga ko'tarildi`);
+    return true;
+  } catch (err) {
+    console.error("Promote admin error:", err);
+    throw new Error(err.message || "Adminlikka ko'tarishda xatolik");
+  }
+}
+
+// Promote user by email (Gmail / Email)
+export async function promoteByEmail(email, currentAdminEmail) {
+  if (!email || !email.includes("@")) {
+    throw new Error("Yaroqli email manzilini kiriting");
+  }
+  const normalizedEmail = email.toLowerCase().trim();
+  const nowIso = new Date().toISOString();
+
+  try {
+    // 1. Store in adminEmails
+    await setDoc(doc(db, "adminEmails", normalizedEmail), {
+      email: normalizedEmail,
+      displayName: normalizedEmail.split("@")[0],
+      role: "admin",
+      addedAt: nowIso,
+      addedBy: currentAdminEmail || "admin",
+    });
+
+    // 2. Check if a user with this email is already registered
+    const usersSnap = await getDocs(
+      query(collection(db, "users"), where("email", "==", normalizedEmail))
+    );
+
+    if (!usersSnap.empty) {
+      const userDoc = usersSnap.docs[0];
+      const uid = userDoc.id;
+      await updateDoc(doc(db, "users", uid), { role: "admin", promotedAt: nowIso });
+      await setDoc(doc(db, "admins", uid), {
+        uid,
+        email: normalizedEmail,
+        displayName: userDoc.data().displayName || normalizedEmail.split("@")[0],
+        role: "admin",
+        promotedAt: nowIso,
+        promotedBy: currentAdminEmail || "admin",
+      });
+    }
+
+    await logAuditEvent("PROMOTE_EMAIL_ADMIN", currentAdminEmail, "adminEmails", normalizedEmail, `${normalizedEmail} adminlar ro'yxatiga qo'shildi`);
+    return true;
+  } catch (err) {
+    console.error("Promote by email error:", err);
+    throw new Error(err.message || "Adminlikka biriktirishda xatolik");
+  }
+}
+
+// Remove an admin (Demote back to regular customer)
+export async function removeAdmin(adminUid, adminEmail, currentAdminEmail) {
+  const normalizedEmail = (adminEmail || "").toLowerCase().trim();
+
+  // Safety protection: Cannot demote superadmin
+  if (normalizedEmail === "dierbekrustamov040@gmail.com") {
+    throw new Error("Asosiy tizim egasini (Superadmin) o'chirib bo'lmaydi!");
+  }
+
+  try {
+    if (adminUid && adminUid !== "superadmin_owner") {
+      await deleteDoc(doc(db, "admins", adminUid));
+      try {
+        await updateDoc(doc(db, "users", adminUid), { role: "customer" });
+      } catch {}
+    }
+
+    if (normalizedEmail) {
+      await deleteDoc(doc(db, "adminEmails", normalizedEmail));
+
+      // Also check any admin doc with this email
+      try {
+        const snap = await getDocs(
+          query(collection(db, "admins"), where("email", "==", normalizedEmail))
+        );
+        for (const d of snap.docs) {
+          await deleteDoc(d.ref);
+        }
+      } catch {}
+    }
+
+    await logAuditEvent("REMOVE_ADMIN", currentAdminEmail, "admins", adminUid || normalizedEmail, `${normalizedEmail} adminlikdan olib tashlandi`);
+    return true;
+  } catch (err) {
+    console.error("Remove admin error:", err);
+    throw new Error(err.message || "Adminlikdan olishda xatolik yuz berdi");
   }
 }
 
